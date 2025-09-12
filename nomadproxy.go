@@ -6,12 +6,12 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -66,7 +66,7 @@ func main() {
 	proxy.ErrorLog = logger.StdLogger((logger.Discard))
 
 	if backendCA != nil && *backendCA != "" {
-		cert, err := ioutil.ReadFile(*backendCA)
+		cert, err := os.ReadFile(*backendCA)
 		if err != nil {
 			log.Fatalf("could not open certificate file: %v", err)
 		}
