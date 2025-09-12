@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/local"
 	"tailscale.com/tsnet"
 	"tailscale.com/types/logger"
 )
@@ -103,7 +103,7 @@ func main() {
 				} else {
 					log.Printf("tailscale is %v", st.BackendState)
 					if st.BackendState == "Running" {
-						log.Println("tailscale is now runnning")
+						log.Println("tailscale is now running")
 						break
 					}
 				}
@@ -135,7 +135,7 @@ func main() {
 	log.Fatal(http.Serve(ln, auditRequests(localClient, proxy)))
 }
 
-func auditRequests(client *tailscale.LocalClient, next http.Handler) http.HandlerFunc {
+func auditRequests(client *local.Client, next http.Handler) http.HandlerFunc {
 	return func(resp http.ResponseWriter, req *http.Request) {
 		err := auditRequest(client, req)
 		if err != nil {
@@ -148,7 +148,7 @@ func auditRequests(client *tailscale.LocalClient, next http.Handler) http.Handle
 	}
 }
 
-func auditRequest(client *tailscale.LocalClient, req *http.Request) error {
+func auditRequest(client *local.Client, req *http.Request) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
