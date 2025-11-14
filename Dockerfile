@@ -12,7 +12,8 @@ COPY nomadproxy.go .
 
 FROM --platform=${BUILDPLATFORM} base AS build
 
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -v -o /usr/local/bin/nomadproxy ./nomadproxy.go
+RUN --mount=type=cache,target=/root/.cache/go-build \
+  CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -v -o /usr/local/bin/nomadproxy ./nomadproxy.go
 
 FROM scratch
 
