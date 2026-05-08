@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -17,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sync/errgroup"
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/v2"
 	"tailscale.com/tsnet"
@@ -70,21 +72,28 @@ func main() {
 		Ephemeral: true,
 	}
 
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	go func() {
-		if err := ts.Start(); err != nil {
-			log.Fatalf("Error starting tsnet.Server: %v", err)
-		}
+	g, ctx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		<-ctx.Done()
+		return ts.Close()
+	})
+	g.Go(func() error {
+		return nonClosedError(ts.Start())
+	})
+
+	g.Go(func() error {
 		localClient, err := ts.LocalClient()
 		if err != nil {
-			log.Fatalf("Error getting localclient: %v", err)
+			return fmt.Errorf("error getting localclient: %v", err)
 		}
 
 		url, err := url.Parse(*backendAddr)
 		if err != nil {
-			log.Fatalf("couldn't parse backend address: %v", err)
+			return fmt.Errorf("couldn't parse backend address: %v", err)
 		}
 
 		proxy := httputil.NewSingleHostReverseProxy(url)
@@ -98,7 +107,7 @@ func main() {
 		if backendCA != nil && *backendCA != "" {
 			cert, err := os.ReadFile(*backendCA)
 			if err != nil {
-				log.Fatalf("could not open certificate file: %v", err)
+				return fmt.Errorf("could not open certificate file: %v", err)
 			}
 			caCertPool := x509.NewCertPool()
 			caCertPool.AppendCertsFromPEM(cert)
@@ -107,7 +116,7 @@ func main() {
 			clientKey := *backendClientKey
 			certificate, err := tls.LoadX509KeyPair(clientCert, clientKey)
 			if err != nil {
-				log.Fatalf("could not load certificate: %v", err)
+				return fmt.Errorf("could not load certificate: %v", err)
 			}
 			proxy.Transport = &http.Transport{
 				TLSClientConfig: &tls.Config{
@@ -124,7 +133,7 @@ func main() {
 				GetCertificate: localClient.GetCertificate,
 			})
 
-			go func() {
+			g.Go(func() error {
 				// wait for tailscale to start before trying to fetch cert names
 				for i := 0; i < 60; i++ {
 					st, err := localClient.Status(ctx)
@@ -137,36 +146,59 @@ func main() {
 							break
 						}
 					}
-					time.Sleep(time.Second)
+					select {
+					case <-ctx.Done():
+						return nil
+					case <-time.After(time.Second):
+					}
 				}
 
 				l80, err := ts.Listen("tcp", ":80")
 				if err != nil {
-					log.Fatal(err)
+					return err
 				}
 				name, ok := localClient.ExpandSNIName(ctx, *hostname)
 				if !ok {
-					log.Fatalf("can't get hostname for https redirect")
+					return fmt.Errorf("can't get hostname for https redirect")
 				}
-				if err := http.Serve(l80, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					http.Redirect(w, r, fmt.Sprintf("https://%s", name), http.StatusMovedPermanently)
-				})); err != nil {
-					log.Fatal(err)
+
+				redirectServer := &http.Server{
+					Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						http.Redirect(w, r, fmt.Sprintf("https://%s", name), http.StatusMovedPermanently)
+					}),
 				}
-			}()
+
+				go func() {
+					<-ctx.Done()
+					redirectServer.Shutdown(context.Background())
+				}()
+
+				return nonClosedError(redirectServer.Serve(l80))
+			})
 		} else {
 			ln, err = ts.Listen("tcp", ":80")
 		}
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 
-		log.Printf("nomadproxy running at %v, proxying to %v", ln.Addr(), *backendAddr)
-		log.Fatal(http.Serve(ln, auditRequests(ctx, localClient, proxy)))
-	}()
+		server := &http.Server{
+			Handler:     auditRequests(ctx, localClient, proxy),
+			BaseContext: func(net.Listener) context.Context { return ctx },
+		}
 
-	<-interrupt
-	ts.Close()
+		go func() {
+			<-ctx.Done()
+			server.Shutdown(context.Background())
+		}()
+
+		log.Printf("nomadproxy running at %v, proxying to %v", ln.Addr(), *backendAddr)
+		return nonClosedError(server.Serve(ln))
+	})
+
+	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+		log.Fatalf("Execution failed: %v", err)
+	}
 }
 
 func newOauthClient() *tailscale.Client {
@@ -249,4 +281,17 @@ func auditRequest(ctx context.Context, client *local.Client, req *http.Request) 
 	}
 	log.Printf("%s %s from (machine %s, user %s)", req.Method, req.URL.Path, machine, user)
 	return nil
+}
+
+func nonClosedError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	if strings.Contains(err.Error(), "use of closed network connection") {
+		return nil
+	}
+	return err
 }
