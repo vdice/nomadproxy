@@ -12,7 +12,9 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"tailscale.com/client/local"
@@ -61,101 +63,110 @@ func main() {
 	}
 
 	ts := &tsnet.Server{
-		Dir:      *tailscaleDir,
-		Hostname: *hostname,
-		Logf:     logger.Discard,
-		AuthKey:  authKey,
+		Dir:       *tailscaleDir,
+		Hostname:  *hostname,
+		Logf:      logger.Discard,
+		AuthKey:   authKey,
+		Ephemeral: true,
 	}
 
-	if err := ts.Start(); err != nil {
-		log.Fatalf("Error starting tsnet.Server: %v", err)
-	}
-	localClient, err := ts.LocalClient()
-	if err != nil {
-		log.Fatalf("Error getting localclient: %v", err)
-	}
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
 
-	url, err := url.Parse(*backendAddr)
-	if err != nil {
-		log.Fatalf("couldn't parse backend address: %v", err)
-	}
-
-	proxy := httputil.NewSingleHostReverseProxy(url)
-	originalDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		req.Host = req.URL.Host
-		originalDirector(req)
-	}
-	proxy.ErrorLog = logger.StdLogger((logger.Discard))
-
-	if backendCA != nil && *backendCA != "" {
-		cert, err := os.ReadFile(*backendCA)
+	go func() {
+		if err := ts.Start(); err != nil {
+			log.Fatalf("Error starting tsnet.Server: %v", err)
+		}
+		localClient, err := ts.LocalClient()
 		if err != nil {
-			log.Fatalf("could not open certificate file: %v", err)
+			log.Fatalf("Error getting localclient: %v", err)
 		}
-		caCertPool := x509.NewCertPool()
-		caCertPool.AppendCertsFromPEM(cert)
 
-		clientCert := *backendClientCert
-		clientKey := *backendClientKey
-		certificate, err := tls.LoadX509KeyPair(clientCert, clientKey)
+		url, err := url.Parse(*backendAddr)
 		if err != nil {
-			log.Fatalf("could not load certificate: %v", err)
+			log.Fatalf("couldn't parse backend address: %v", err)
 		}
-		proxy.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{
-				RootCAs:      caCertPool,
-				Certificates: []tls.Certificate{certificate},
-			},
+
+		proxy := httputil.NewSingleHostReverseProxy(url)
+		originalDirector := proxy.Director
+		proxy.Director = func(req *http.Request) {
+			req.Host = req.URL.Host
+			originalDirector(req)
 		}
-	}
+		proxy.ErrorLog = logger.StdLogger((logger.Discard))
 
-	var ln net.Listener
-	if *useHTTPS {
-		ln, err = ts.Listen("tcp", ":443")
-		ln = tls.NewListener(ln, &tls.Config{
-			GetCertificate: localClient.GetCertificate,
-		})
-
-		go func() {
-			// wait for tailscale to start before trying to fetch cert names
-			for i := 0; i < 60; i++ {
-				st, err := localClient.Status(ctx)
-				if err != nil {
-					log.Printf("error retrieving tailscale status; retrying: %v", err)
-				} else {
-					log.Printf("tailscale is %v", st.BackendState)
-					if st.BackendState == "Running" {
-						log.Println("tailscale is now running")
-						break
-					}
-				}
-				time.Sleep(time.Second)
-			}
-
-			l80, err := ts.Listen("tcp", ":80")
+		if backendCA != nil && *backendCA != "" {
+			cert, err := os.ReadFile(*backendCA)
 			if err != nil {
-				log.Fatal(err)
+				log.Fatalf("could not open certificate file: %v", err)
 			}
-			name, ok := localClient.ExpandSNIName(ctx, *hostname)
-			if !ok {
-				log.Fatalf("can't get hostname for https redirect")
-			}
-			if err := http.Serve(l80, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				http.Redirect(w, r, fmt.Sprintf("https://%s", name), http.StatusMovedPermanently)
-			})); err != nil {
-				log.Fatal(err)
-			}
-		}()
-	} else {
-		ln, err = ts.Listen("tcp", ":80")
-	}
-	if err != nil {
-		log.Fatal(err)
-	}
+			caCertPool := x509.NewCertPool()
+			caCertPool.AppendCertsFromPEM(cert)
 
-	log.Printf("nomadproxy running at %v, proxying to %v", ln.Addr(), *backendAddr)
-	log.Fatal(http.Serve(ln, auditRequests(ctx, localClient, proxy)))
+			clientCert := *backendClientCert
+			clientKey := *backendClientKey
+			certificate, err := tls.LoadX509KeyPair(clientCert, clientKey)
+			if err != nil {
+				log.Fatalf("could not load certificate: %v", err)
+			}
+			proxy.Transport = &http.Transport{
+				TLSClientConfig: &tls.Config{
+					RootCAs:      caCertPool,
+					Certificates: []tls.Certificate{certificate},
+				},
+			}
+		}
+
+		var ln net.Listener
+		if *useHTTPS {
+			ln, err = ts.Listen("tcp", ":443")
+			ln = tls.NewListener(ln, &tls.Config{
+				GetCertificate: localClient.GetCertificate,
+			})
+
+			go func() {
+				// wait for tailscale to start before trying to fetch cert names
+				for i := 0; i < 60; i++ {
+					st, err := localClient.Status(ctx)
+					if err != nil {
+						log.Printf("error retrieving tailscale status; retrying: %v", err)
+					} else {
+						log.Printf("tailscale is %v", st.BackendState)
+						if st.BackendState == "Running" {
+							log.Println("tailscale is now running")
+							break
+						}
+					}
+					time.Sleep(time.Second)
+				}
+
+				l80, err := ts.Listen("tcp", ":80")
+				if err != nil {
+					log.Fatal(err)
+				}
+				name, ok := localClient.ExpandSNIName(ctx, *hostname)
+				if !ok {
+					log.Fatalf("can't get hostname for https redirect")
+				}
+				if err := http.Serve(l80, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					http.Redirect(w, r, fmt.Sprintf("https://%s", name), http.StatusMovedPermanently)
+				})); err != nil {
+					log.Fatal(err)
+				}
+			}()
+		} else {
+			ln, err = ts.Listen("tcp", ":80")
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		log.Printf("nomadproxy running at %v, proxying to %v", ln.Addr(), *backendAddr)
+		log.Fatal(http.Serve(ln, auditRequests(ctx, localClient, proxy)))
+	}()
+
+	<-interrupt
+	ts.Close()
 }
 
 func newOauthClient() *tailscale.Client {
